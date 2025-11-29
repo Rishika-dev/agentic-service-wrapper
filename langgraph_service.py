@@ -198,12 +198,13 @@ class LangGraphService:
             )
 
         # Call the tool directly (no ReAct agent needed)
-        # The @tool decorator wraps it, but we can call it as a function
+        # The @tool decorator wraps it, so we need to use .invoke() method
         # Reset IPFS hash before calling tool
         self.last_ipfs_hash = None
-        image_base64 = self.generate_image_tool(
-            prompt=prompt, model_type=model_type_str
-        )
+        image_base64 = self.generate_image_tool.invoke({
+            "prompt": prompt,
+            "model_type": model_type_str
+        })
 
         # Get IPFS hash from tool execution (stored by tool)
         ipfs_hash = self.last_ipfs_hash

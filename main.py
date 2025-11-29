@@ -13,13 +13,13 @@ import cuid2
 import base64
 from datetime import datetime
 import hashlib
-
+import logging
 from image_service import ImageGenerationService, ModelType
 from blockfrost_service import BlockfrostService
 
 # region congif
 # Configure logging
-logger = setup_logging()
+logger = setup_logging(logging.DEBUG)
 
 # Load environment variables
 load_dotenv(override=True)
@@ -128,18 +128,16 @@ class InputDataItem(BaseModel):
 
 
 class StartJobRequest(BaseModel):
-    input_data: list[InputDataItem]
-
+    input_data: dict[str, str]
+    identifier_from_purchaser: str
     class Config:
         json_schema_extra = {
             "example": {
-                "input_data": [
-                    {
-                        "key": "prompt",
-                        "value": "Generate an image of a gray tabby cat hugging an otter",
-                    },
-                    {"key": "model_type", "value": "DALLE"},
-                ]
+                "identifier_from_purchaser": "12345671234567",
+                "input_data": {
+                    "prompt": "Generate an image of a gray tabby cat hugging an otter",
+                    "model_type": "DALLE"
+                }
             }
         }
 
@@ -206,11 +204,12 @@ async def start_job(data: StartJobRequest):
             )
 
         # generate identifier_from_purchaser internally using cuid2
-        identifier_from_purchaser = cuid2.Cuid().generate()
-        logger.info(f"Generated identifier_from_purchaser: {identifier_from_purchaser}")
+        # identifier_from_purchaser = cuid2.Cuid().generate()
+        # logger.info(f"Generated identifier_from_purchaser: {identifier_from_purchaser}")
 
         # convert input_data array to dict for internal processing
-        input_data_dict = {item.key: item.value for item in data.input_data}
+        # input_data_dict = {item.key: item.value for item in data.input_data}
+        input_data_dict = data.input_data
 
         # validate required image-generation input
         if "prompt" not in input_data_dict:
@@ -253,91 +252,62 @@ async def start_job(data: StartJobRequest):
             agent_identifier=agent_identifier,
             # amounts=amounts,
             config=config,
-            identifier_from_purchaser=identifier_from_purchaser,
+            identifier_from_purchaser=data.identifier_from_purchaser,
             input_data=input_data_dict,
             network=NETWORK,
         )
 
         logger.info("Creating payment request...")
         payment_request = await payment.create_payment_request()
-        payment_id = payment_request["data"]["blockchainIdentifier"]
-        payment.payment_ids.add(payment_id)
-        logger.info(f"Created payment request with ID: {payment_id}")
+        blockchain_identifier = payment_request["data"]["blockchainIdentifier"]
+        payment.payment_ids.add(blockchain_identifier)
+        logger.info(f"Created payment request with blockchain identifier: {blockchain_identifier}")
 
         # Store job info (Awaiting payment)
         jobs[job_id] = {
             "status": "awaiting_payment",
             "payment_status": "pending",
-            "payment_id": payment_id,
-            "input_data": input_data_dict,
+            "blockchain_identifier": blockchain_identifier,
+            "input_data": data.input_data,
             "result": None,
-            "identifier_from_purchaser": identifier_from_purchaser,
+            "identifier_from_purchaser": data.identifier_from_purchaser
         }
 
-        async def payment_callback(payment_id: str):
-            await handle_payment_status(job_id, payment_id)
+        async def payment_callback(blockchain_identifier: str):
+            await handle_payment_status(job_id, blockchain_identifier)
 
         # Start monitoring the payment status
         payment_instances[job_id] = payment
         logger.info(f"Starting payment status monitoring for job {job_id}")
         await payment.start_status_monitoring(payment_callback)
 
-        # Get SELLER_VKEY from environment
-        seller_vkey = os.getenv("SELLER_VKEY", "")
-        if not seller_vkey:
-            logger.error("SELLER_VKEY environment variable is missing")
-            raise HTTPException(
-                status_code=500,
-                detail="Server configuration error: SELLER_VKEY not configured. Please contact administrator.",
-            )
-
-        # Return the response in the format expected by the /purchase endpoint
-        # Include both the original fields and the extended fields
+        # Return the response in the required format
         return {
-            # Original fields for backward compatibility
+            "status": "success",
             "job_id": job_id,
-            "payment_id": payment_id,
-            # Extended fields for /purchase endpoint
-            "identifierFromPurchaser": identifier_from_purchaser,
-            "network": NETWORK,
-            "sellerVkey": seller_vkey,
-            "paymentType": "Web3CardanoV1",
-            "blockchainIdentifier": payment_id,
-            "submitResultTime": str(payment_request["data"]["submitResultTime"]),
-            "unlockTime": str(payment_request["data"]["unlockTime"]),
-            "externalDisputeUnlockTime": str(
-                payment_request["data"]["externalDisputeUnlockTime"]
-            ),
+            "blockchainIdentifier": blockchain_identifier,
+            "submitResultTime": payment_request["data"]["submitResultTime"],
+            "unlockTime": payment_request["data"]["unlockTime"],
+            "externalDisputeUnlockTime": payment_request["data"]["externalDisputeUnlockTime"],
             "agentIdentifier": agent_identifier,
-            "inputHash": payment_request["data"]["inputHash"],
+            "sellerVKey": os.getenv("SELLER_VKEY"),
+            "identifierFromPurchaser": data.identifier_from_purchaser,
+            # "amounts": amounts,
+            "input_hash": payment.input_hash,
+            "payByTime": payment_request["data"]["payByTime"],
         }
-    except HTTPException:
-        # re-raise HTTP exceptions (our custom errors)
-        raise
-    except ValueError as e:
-        logger.error(f"Value error in start_job: {str(e)}", exc_info=True)
-        if "PAYMENT_AMOUNT" in str(e):
-            raise HTTPException(
-                status_code=500,
-                detail="Server configuration error: Invalid PAYMENT_AMOUNT value. Please contact administrator.",
-            )
-        raise HTTPException(status_code=400, detail=f"Invalid input data: {str(e)}")
     except KeyError as e:
         logger.error(f"Missing required field in request: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Missing required field: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error in start_job: {str(e)}", exc_info=True)
-        # check if it's a masumi payment service error
-        if "Network error" in str(e) or "payment" in str(e).lower():
-            raise HTTPException(
-                status_code=502,
-                detail="Payment service unavailable. Please try again later or contact administrator.",
-            )
         raise HTTPException(
-            status_code=500,
-            detail="Internal server error. Please contact administrator.",
+            status_code=400,
+            detail="Bad Request: If input_data or identifier_from_purchaser is missing, invalid, or does not adhere to the schema."
         )
-
+    except Exception as e:
+        logger.error(f"Error in start_job: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=400,
+            detail="Input_data or identifier_from_purchaser is missing, invalid, or does not adhere to the schema."
+        )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # region 2) Process Payment and Execute AI Task
